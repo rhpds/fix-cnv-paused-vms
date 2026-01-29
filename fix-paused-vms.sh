@@ -144,47 +144,12 @@ check_ceph_health() {
     fi
 }
 
-# Clear Ceph blocklist
-clear_blocklist() {
-    log_info "Checking Ceph blocklist..."
-    
-    local blocklist_count=$(oc exec -n "$STORAGE_NAMESPACE" deploy/rook-ceph-tools -- ceph osd blocklist ls 2>/dev/null | grep -c "^10\." || echo "0")
-    
-    if [[ "$blocklist_count" -eq 0 ]]; then
-        log_info "No blocklist entries found"
-        return
-    fi
-    
-    log_warning "Found $blocklist_count blocklist entries"
-    
-    if [[ "$SKIP_CONFIRMATION" == false ]]; then
-        read -p "Clear all blocklist entries? (y/N): " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            log_info "Skipping blocklist clearing"
-            return
-        fi
-    fi
-    
-    log_info "Clearing blocklist entries..."
-    
-    oc exec -n "$STORAGE_NAMESPACE" deploy/rook-ceph-tools -- ceph osd blocklist ls 2>/dev/null | \
-        grep "^10\." | \
-        awk '{print $1}' | \
-        while read -r entry; do
-            log_info "  Removing: $entry"
-            oc exec -n "$STORAGE_NAMESPACE" deploy/rook-ceph-tools -- ceph osd blocklist rm "$entry" 2>&1 | tee -a "$LOG_FILE"
-        done
-    
-    log_success "Blocklist cleared"
-}
-
 # Find paused VMs
 find_paused_vms() {
     log_info "Finding paused VMs..."
     
     local paused_vms=$(oc get vmi $TARGET_NAMESPACE -o json 2>/dev/null | \
-        jq -r '.items[] | select(.status.conditions[]? | select(.type=="Paused" and .status=="True")) | "\(.metadata.namespace) \(.metadata.name)"')
+        jq -r '.items[] | select(.status.conditions[]? | select(.type=="Paused" and .status=="True")) | "\(.metadata.namespace) \(.metadata.name) \(.status.nodeName // "unknown")"')
     
     if [[ -z "$paused_vms" ]]; then
         log_success "No paused VMs found!"
@@ -205,6 +170,91 @@ find_paused_vms() {
     fi
     
     return 0
+}
+
+# Get IPs of nodes hosting paused VMs
+get_affected_node_ips() {
+    log_info "Identifying nodes hosting paused VMs..."
+    
+    # Extract unique node names from paused VMs list
+    local nodes=$(awk '{print $3}' /tmp/paused_vms_list.txt | sort -u | grep -v "^unknown$" || true)
+    
+    if [[ -z "$nodes" ]]; then
+        log_warning "No node information found for paused VMs"
+        return 1
+    fi
+    
+    # Get IP addresses for these nodes
+    > /tmp/affected_node_ips.txt
+    for node in $nodes; do
+        local ip=$(oc get node "$node" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || echo "")
+        if [[ -n "$ip" ]]; then
+            echo "$ip" >> /tmp/affected_node_ips.txt
+            log_info "  Node: $node -> IP: $ip"
+        fi
+    done
+    
+    local ip_count=$(wc -l < /tmp/affected_node_ips.txt)
+    log_success "Found $ip_count unique node IPs hosting paused VMs"
+    
+    return 0
+}
+
+# Clear Ceph blocklist for affected nodes only
+clear_blocklist() {
+    log_info "Checking Ceph blocklist for affected nodes..."
+    
+    if [[ ! -f /tmp/affected_node_ips.txt ]]; then
+        log_warning "No affected node IPs found. Skipping blocklist clearing."
+        return
+    fi
+    
+    # Get all current blocklist entries
+    local all_blocklist=$(oc exec -n "$STORAGE_NAMESPACE" deploy/rook-ceph-tools -- ceph osd blocklist ls 2>/dev/null | grep "^10\." || true)
+    
+    if [[ -z "$all_blocklist" ]]; then
+        log_info "No blocklist entries found"
+        return
+    fi
+    
+    # Filter blocklist to only entries matching affected node IPs
+    > /tmp/blocklist_to_remove.txt
+    while IFS= read -r node_ip; do
+        echo "$all_blocklist" | grep "^${node_ip}:" >> /tmp/blocklist_to_remove.txt || true
+    done < /tmp/affected_node_ips.txt
+    
+    local blocklist_count=$(wc -l < /tmp/blocklist_to_remove.txt 2>/dev/null || echo "0")
+    
+    if [[ "$blocklist_count" -eq 0 ]]; then
+        log_info "No blocklist entries found for nodes hosting paused VMs"
+        return
+    fi
+    
+    log_warning "Found $blocklist_count blocklist entries for affected nodes:"
+    head -5 /tmp/blocklist_to_remove.txt | while read -r entry; do
+        log_info "  - $(echo $entry | awk '{print $1}')"
+    done
+    if [[ $blocklist_count -gt 5 ]]; then
+        log_info "  ... and $((blocklist_count - 5)) more"
+    fi
+    
+    if [[ "$SKIP_CONFIRMATION" == false ]]; then
+        read -p "Clear these blocklist entries? (y/N): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            log_info "Skipping blocklist clearing"
+            return
+        fi
+    fi
+    
+    log_info "Clearing blocklist entries for affected nodes..."
+    
+    awk '{print $1}' /tmp/blocklist_to_remove.txt | while read -r entry; do
+        log_info "  Removing: $entry"
+        oc exec -n "$STORAGE_NAMESPACE" deploy/rook-ceph-tools -- ceph osd blocklist rm "$entry" 2>&1 | tee -a "$LOG_FILE" | grep -v "^$" || true
+    done
+    
+    log_success "Blocklist cleared for affected nodes"
 }
 
 # Restart paused VMs in batches
@@ -308,15 +358,19 @@ main() {
     
     check_prerequisites
     check_ceph_health
-    clear_blocklist
     
     if find_paused_vms; then
+        get_affected_node_ips
+        clear_blocklist
         restart_vms
         verify_recovery
     fi
     
     log_success "Recovery process complete!"
     log_info "Full log available at: $LOG_FILE"
+    
+    # Cleanup temp files
+    rm -f /tmp/paused_vms_list.txt /tmp/affected_node_ips.txt /tmp/blocklist_to_remove.txt
 }
 
 # Run main function
