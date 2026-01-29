@@ -1,0 +1,22 @@
+# Diagnostic output directories
+node-diagnostics-*/
+incident-investigation-*/
+
+# Log files
+*.log
+
+# Temporary files
+/tmp/
+*.tmp
+*.swp
+*.swo
+*~
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Editor-specific files
+.vscode/
+.idea/
+*.iml
